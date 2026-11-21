@@ -1,7 +1,8 @@
-
 #include <AccelStepper.h>
 #include <Servo.h>
 #include <math.h>
+
+// Board: Arduino Mega 2560 (pins 47-54 do not exist on an Uno)
 
 // Pin Definitions
 #define limitSwitch1 11
@@ -30,22 +31,25 @@ const float theta1AngleToSteps = 44.444444;
 const float theta2AngleToSteps = 35.555555;
 const float phiAngleToSteps = 10;
 const float zDistanceToSteps = 100;
-const int timeSlice = 3000;
+const int timeSlice = 3000;      // ms per time unit
+const int maxPositions = 50;     // size of the stored arrays
 
 // Variables
 double x = 10.0;
 double y = 10.0;
 double theta1, theta2, phi, z;
-int stepper1Position, stepper2Position, stepper3Position, stepper4Position;
+long stepper1Position, stepper2Position, stepper3Position, stepper4Position;
 String content = "";
 int data[11];
-int theta1Array[50];
-int theta2Array[50];
-int phiArray[50];
-int zArray[50];
-int gripperArray[50];
-int directionArray[50];
-int delays[50];
+
+// long (not int): int is only 16 bit on the Mega, so e.g. 11 * 3000 overflows
+long theta1Array[maxPositions];
+long theta2Array[maxPositions];
+long phiArray[maxPositions];
+long zArray[maxPositions];
+int gripperArray[maxPositions];
+int directionArray[maxPositions];
+long delays[maxPositions];
 int positionsCounter = 0;
 
 // Function Prototypes
@@ -58,21 +62,19 @@ void saveData();
 void clearData();
 void executeStoredSteps();
 void moveToPosition();
-void serialFlush();
-void controlRCCar(int direction);
-void setCarMotorSpeeds(int speed);
-void moveForward();
-void moveBackward();
-void moveLeft();
-void moveRight();
-void moveLeftForward();
-void moveRightForward();
-void moveLeftBackward();
-void moveRightBackward();
+void moveToStep(int i);
+bool steppersRunning();
+void runSteppers();
+void moveSteppersToPosition();
+void setStepperSpeeds(int speed);
+void updateSerialData();
+void controlRCCar(int direction, long duration);
+void driveWheels(int lb, int lf, int rb, int rf, int speed, long duration);
 void stopCar();
 
 void setup() {
   Serial.begin(9600);
+  Serial.setTimeout(100); // default is 1000 ms, which made every command wait 1 s
   initializePins();
   initializeSteppers();
   initializeServo();
@@ -129,57 +131,49 @@ void initializeSteppers() {
 void initializeServo() {
   gripperServo.attach(A0, 600, 2500);
   delay(1000);
-  for (int i = 0; i < 50; i++) {
+  for (int i = 0; i < maxPositions; i++) {
     delays[i] = 0;
   }
 }
 
 void homing() {
   // Homing Stepper4
+  stepper4.setSpeed(1500);
   while (digitalRead(limitSwitch4) != 0) {
-    stepper4.setSpeed(1500);
     stepper4.runSpeed();
-    stepper4.setCurrentPosition(0); // When limit switch pressed set position to 0 steps
   }
+  stepper4.setCurrentPosition(0); // limit switch pressed -> this is position 0
   delay(20);
-  stepper4.moveTo(0);
-  while (stepper4.currentPosition() != 0) {
-    stepper4.run();
-  }
 
   // Homing Stepper3
+  stepper3.setSpeed(-500);
   while (digitalRead(limitSwitch3) != 0) {
-    stepper3.setSpeed(-500);
     stepper3.runSpeed();
-    stepper3.setCurrentPosition(-800); // When limit switch pressed set position to 0 steps
   }
+  stepper3.setCurrentPosition(-800); // limit switch pressed -> this is position -800
   delay(20);
-  stepper3.moveTo(-800);
-  while (stepper3.currentPosition() != -800) {
-    stepper3.run();
-  }
 
   // Homing Stepper2
+  stepper2.setSpeed(500);
   while (digitalRead(limitSwitch2) != 1) {
-    stepper2.setSpeed(500);
     stepper2.runSpeed();
-    stepper2.setCurrentPosition(800); // When limit switch pressed set position to -5440 steps
   }
+  stepper2.setCurrentPosition(800); // limit switch pressed -> this is position 800
   delay(20);
   stepper2.moveTo(100);
-  while (stepper2.currentPosition() != 200) {
+  while (stepper2.distanceToGo() != 0) { // was: currentPosition() != 200 (never true -> hang)
     stepper2.run();
   }
 
   // Homing Stepper1
+  stepper1.setSpeed(500);
   while (digitalRead(limitSwitch1) != 1) {
-    stepper1.setSpeed(500);
     stepper1.runSpeed();
-    stepper1.setCurrentPosition(800); // When limit switch pressed set position to 0 steps
   }
+  stepper1.setCurrentPosition(800); // limit switch pressed -> this is position 800
   delay(20);
   stepper1.moveTo(100);
-  while (stepper1.currentPosition() != 200) {
+  while (stepper1.distanceToGo() != 0) { // was: currentPosition() != 200 (never true -> hang)
     stepper1.run();
   }
 }
@@ -194,12 +188,16 @@ void readSerialData() {
 }
 
 void saveData() {
+  // Do not write past the end of the arrays
+  if (positionsCounter >= maxPositions) {
+    return;
+  }
   theta1Array[positionsCounter] = data[2] * theta1AngleToSteps;
   theta2Array[positionsCounter] = data[3] * theta2AngleToSteps;
   phiArray[positionsCounter] = data[4] * phiAngleToSteps;
   zArray[positionsCounter] = data[5] * zDistanceToSteps;
   gripperArray[positionsCounter] = data[6];
-  delays[positionsCounter] = data[8] * timeSlice;
+  delays[positionsCounter] = (long)data[8] * timeSlice; // long math, int would overflow
   directionArray[positionsCounter] = data[9];
   positionsCounter++;
 }
@@ -218,17 +216,21 @@ void clearData() {
 void executeStoredSteps() {
   for (int i = 0; i <= positionsCounter - 1; i++) {
     if (data[1] == 0) break;
+
+    setStepperSpeeds(data[7]);
     moveToStep(i);
     while (steppersRunning()) {
       runSteppers();
     }
+
     if (i == 0) {
       gripperServo.write(gripperArray[i]);
     } else if (gripperArray[i] != gripperArray[i - 1]) {
       gripperServo.write(gripperArray[i]);
       delay(800);
     }
-    controlRCCar(directionArray[i]);
+
+    controlRCCar(directionArray[i], delays[i]);
     delay(500);
     updateSerialData();
     if (data[1] == 0) break;
@@ -248,99 +250,76 @@ void moveToPosition() {
   }
 }
 
-void serialFlush() {
-  while (Serial.available() > 0) {
-    Serial.read();
-  }
-}
+// ---------------- RC car (mecanum wheels) ----------------
+// Each wheel gets +1 (forward), -1 (backward) or 0 (stopped).
+// If one wheel turns the wrong way, flip it with setPinsInverted(true, false, false)
+// in initializeSteppers() (typical for the right-side motors).
+void controlRCCar(int direction, long duration) {
+  int lb = 0; // left back
+  int lf = 0; // left front
+  int rb = 0; // right back
+  int rf = 0; // right front
 
-void controlRCCar(int direction) {
-  setCarMotorSpeeds(data[7]);
   switch (direction) {
-    case 1: moveForward(); break;
-    case 2: moveBackward(); break;
-    case 3: moveLeft(); break;
-    case 4: moveRight(); break;
-    case 5: moveLeftForward(); break;
-    case 6: moveRightForward(); break;
-    case 7: moveLeftBackward(); break;
-    case 8: moveRightBackward(); break;
-    default: stopCar(); break;
+    case 1: // forward
+      lb = 1;  lf = 1;  rb = 1;  rf = 1;
+      break;
+    case 2: // backward
+      lb = -1; lf = -1; rb = -1; rf = -1;
+      break;
+    case 3: // strafe left
+      lb = 1;  lf = -1; rb = -1; rf = 1;
+      break;
+    case 4: // strafe right
+      lb = -1; lf = 1;  rb = 1;  rf = -1;
+      break;
+    case 5: // diagonal left-forward
+      lb = 1;  lf = 0;  rb = 0;  rf = 1;
+      break;
+    case 6: // diagonal right-forward
+      lb = 0;  lf = 1;  rb = 1;  rf = 0;
+      break;
+    case 7: // diagonal left-backward
+      lb = 0;  lf = -1; rb = -1; rf = 0;
+      break;
+    case 8: // diagonal right-backward
+      lb = -1; lf = 0;  rb = 0;  rf = -1;
+      break;
+    default: // 0 or unknown -> stay still
+      stopCar();
+      return;
   }
+
+  driveWheels(lb, lf, rb, rf, data[7], duration);
 }
 
-void setCarMotorSpeeds(int speed) {
-  leftBackWheel.setSpeed(speed);
-  leftFrontWheel.setSpeed(speed);
-  rightBackWheel
+// Runs the wheels at the given speed for 'duration' ms, then stops them.
+// runSpeed() makes at most ONE step per call, so it has to be called in a loop.
+void driveWheels(int lb, int lf, int rb, int rf, int speed, long duration) {
+  leftBackWheel.setSpeed(lb * speed);
+  leftFrontWheel.setSpeed(lf * speed);
+  rightBackWheel.setSpeed(rb * speed);
+  rightFrontWheel.setSpeed(rf * speed);
 
-.setSpeed(speed);
-  rightFrontWheel.setSpeed(speed);
-}
+  unsigned long startTime = millis();
+  while (millis() - startTime < (unsigned long)duration) {
+    leftBackWheel.runSpeed();
+    leftFrontWheel.runSpeed();
+    rightBackWheel.runSpeed();
+    rightFrontWheel.runSpeed();
+  }
 
-void moveForward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveBackward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveLeft() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveRight() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveLeftForward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveRightForward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveLeftBackward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
-}
-
-void moveRightBackward() {
-  leftBackWheel.runSpeed();
-  leftFrontWheel.runSpeed();
-  rightBackWheel.runSpeed();
-  rightFrontWheel.runSpeed();
+  stopCar();
 }
 
 void stopCar() {
-  leftBackWheel.stop();
-  leftFrontWheel.stop();
-  rightBackWheel.stop();
-  rightFrontWheel.stop();
+  leftBackWheel.setSpeed(0);
+  leftFrontWheel.setSpeed(0);
+  rightBackWheel.setSpeed(0);
+  rightFrontWheel.setSpeed(0);
 }
 
+// ---------------- Arm helpers ----------------
 void moveToStep(int i) {
   stepper1.moveTo(theta1Array[i]);
   stepper2.moveTo(theta2Array[i]);
@@ -366,19 +345,27 @@ void moveSteppersToPosition() {
   stepper4.moveTo(stepper4Position);
 }
 
+// run() ignores setSpeed(); it follows setMaxSpeed() + acceleration.
+// A max speed of 0 would make the motors never move (and the while loops never end),
+// so a speed <= 0 keeps the previous max speed.
 void setStepperSpeeds(int speed) {
-  stepper1.setSpeed(speed);
-  stepper2.setSpeed(speed);
-  stepper3.setSpeed(speed);
-  stepper4.setSpeed(speed);
+  if (speed <= 0) {
+    return;
+  }
+  if (speed > 4000) {
+    speed = 4000;
+  }
+  stepper1.setMaxSpeed(speed);
+  stepper2.setMaxSpeed(speed);
+  stepper3.setMaxSpeed(speed);
+  stepper4.setMaxSpeed(speed);
 }
 
+// Only read when a new command has actually arrived.
+// Before, the buffer was flushed first, so readString() timed out on an empty string,
+// every data[] became 0 and playback stopped after the first step.
 void updateSerialData() {
-  serialFlush();
-  content = Serial.readString();
-  for (int j = 0; j < 11; j++) {
-    int index = content.indexOf(",");
-    data[j] = atol(content.substring(0, index).c_str());
-    content = content.substring(index + 1);
+  if (Serial.available() > 0) {
+    readSerialData();
   }
 }
